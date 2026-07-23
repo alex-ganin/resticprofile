@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -81,6 +82,43 @@ func TestMetricsHandlerTrailingNewlineGuard(t *testing.T) {
 		strings.Contains(body, "\nmissing_newline_at_end 1") ||
 			strings.HasSuffix(body, "\nmissing_newline_at_end 1\n"),
 		"textfile line must start at a newline boundary, not glued to a prior partial line")
+}
+
+// TestMetricsHandlerGzipRoundTrip confirms that a scraper sending
+// Accept-Encoding: gzip (Prometheus and Go's default client do) gets a single,
+// valid gzip stream covering both the runtime block and the appended textfile.
+// Before the fix promhttp gzipped only its own body and the raw textfile was
+// appended past the end of that gzip member, so decoding failed with
+// "gzip: invalid header".
+func TestMetricsHandlerGzipRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	textfile := filepath.Join(dir, "self.prom")
+	require.NoError(t, os.WriteFile(textfile, []byte("# HELP x test counter\nx_total 7\n"), 0o644))
+
+	srv := httptestMetricsServer(t, textfile)
+
+	// Disable the transport's transparent gzip so we decode the body ourselves
+	// and would observe a corrupt stream if the response were malformed.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/metrics", nil)
+	require.NoError(t, err)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := (&http.Client{Transport: &http.Transport{DisableCompression: true}}).Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
+
+	gz, err := gzip.NewReader(resp.Body)
+	require.NoError(t, err, "response must be a single valid gzip stream")
+	data, err := io.ReadAll(gz)
+	require.NoError(t, err, "decoding the whole body must not hit invalid gzip data")
+	require.NoError(t, gz.Close())
+
+	body := string(data)
+	assert.Contains(t, body, "go_goroutines", "runtime metrics should be present")
+	assert.True(t, strings.HasSuffix(body, "x_total 7\n"),
+		"textfile body must be the last segment inside the same gzip stream")
 }
 
 // TestMetricsServerGracefulShutdown starts the metrics server on a free port,

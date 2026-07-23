@@ -1,14 +1,18 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/creativeprojects/clog"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -65,7 +69,14 @@ func newMetricsServer(port int, textfile string) *metricsServer {
 // exposition-format bodies terminated with a newline, so we can append
 // the textfile body without a separator.
 func (m *metricsServer) handler() http.Handler {
-	runtime := promhttp.Handler()
+	// Disable promhttp's own gzip: it would compress only its runtime block,
+	// and the raw textfile we append afterwards would land past the end of
+	// that gzip member — every scraper then fails with "gzip: invalid header".
+	// We compress the whole response (runtime + textfile) as one gzip stream
+	// below instead.
+	runtime := promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{
+		DisableCompression: true,
+	})
 	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
 		data, err := os.ReadFile(m.textfile) //nolint:gosec // textfile path is operator-supplied
 		if err != nil {
@@ -79,11 +90,17 @@ func (m *metricsServer) handler() http.Handler {
 		}
 
 		// Let promhttp own the response headers, status and body prefix.
-		// wrapWriter tees every Write through `resp`, so anything promhttp
-		// writes reaches the wire and we can append our textfile body
-		// afterwards without having to know whether promhttp will gzip,
-		// negotiate content-type, or pick a non-200 status.
+		// wrapWriter tees every body Write through ww.body — the gzip writer
+		// when the client accepts it, the raw connection otherwise — so we can
+		// append our textfile body afterwards without having to know whether
+		// promhttp negotiated content-type or picked a non-200 status.
 		ww := &wrapWriter{ResponseWriter: resp}
+		if acceptsGzip(req) {
+			resp.Header().Set("Content-Encoding", "gzip")
+			gz := gzip.NewWriter(resp)
+			defer gz.Close()
+			ww.body = gz
+		}
 		runtime.ServeHTTP(ww, req)
 
 		if ww.status >= 400 {
@@ -113,6 +130,7 @@ func (m *metricsServer) handler() http.Handler {
 // can decide after-the-fact whether it is safe to append more bytes.
 type wrapWriter struct {
 	http.ResponseWriter
+	body        io.Writer // body sink; when nil, writes go straight to ResponseWriter
 	status      int
 	wroteHeader bool
 }
@@ -133,15 +151,41 @@ func (w *wrapWriter) Write(b []byte) (int, error) {
 		w.status = http.StatusOK
 		w.wroteHeader = true
 	}
+	if w.body != nil {
+		return w.body.Write(b)
+	}
 	return w.ResponseWriter.Write(b)
 }
 
 // Flush forwards to the underlying writer when it supports http.Flusher,
-// which promhttp uses for streaming large metric sets.
+// which promhttp uses for streaming large metric sets. When gzipping, the
+// gzip writer is flushed first so its buffered bytes reach the connection.
 func (w *wrapWriter) Flush() {
+	if gz, ok := w.body.(*gzip.Writer); ok {
+		_ = gz.Flush()
+	}
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// acceptsGzip reports whether the client offered gzip in Accept-Encoding.
+// An absent header, a bare "identity" (as the tests send), or an explicit
+// "gzip;q=0" all mean no.
+func acceptsGzip(req *http.Request) bool {
+	for _, part := range strings.Split(req.Header.Get("Accept-Encoding"), ",") {
+		fields := strings.Split(strings.TrimSpace(part), ";")
+		if !strings.EqualFold(strings.TrimSpace(fields[0]), "gzip") {
+			continue
+		}
+		for _, p := range fields[1:] {
+			if strings.EqualFold(strings.TrimSpace(p), "q=0") {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // run starts the HTTP server and blocks until quit is closed. On shutdown it
